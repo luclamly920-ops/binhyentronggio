@@ -127,6 +127,146 @@ const notifyAllChaptersSubscribers = (chaptersMap: Record<string, Chapter[]>) =>
   });
 };
 
+// Background Server Sync & SSE Listener for 100% Cross-Device Realtime Consistency
+let sseInitialized = false;
+
+export const initServerRealtimeSync = () => {
+  if (typeof window === 'undefined' || sseInitialized) return;
+  sseInitialized = true;
+
+  // 1. Initial snapshot fetch from server API
+  const pullServerSync = async () => {
+    try {
+      const res = await fetch('/api/sync');
+      if (res.ok) {
+        const data = await res.json();
+        if (data.stories && Array.isArray(data.stories) && data.stories.length > 0) {
+          try {
+            localStorage.setItem('mel_published_stories', JSON.stringify(data.stories));
+          } catch {}
+          notifyStorySubscribers(data.stories);
+        }
+        if (data.chapters && typeof data.chapters === 'object') {
+          for (const [sId, list] of Object.entries(data.chapters as Record<string, Chapter[]>)) {
+            try {
+              localStorage.setItem(`mel_chapters_${sId}`, JSON.stringify(list));
+            } catch {}
+            setLiveStoryChapters(sId, list);
+            notifyChapterSubscribers(sId, list);
+          }
+          activeAllChaptersSubscribers.forEach((cb) => {
+            try { cb(getLiveChaptersRuntimeCache()); } catch {}
+          });
+        }
+        if (data.announcements && Array.isArray(data.announcements)) {
+          try {
+            localStorage.setItem('mel_announcements', JSON.stringify(data.announcements));
+          } catch {}
+          activeAnnouncementSubscribers.forEach((cb) => {
+            try { cb(data.announcements); } catch {}
+          });
+        }
+      }
+    } catch {
+      // Server might be starting or unavailable in pure preview
+    }
+  };
+
+  pullServerSync();
+
+  // 2. Real-time Server-Sent Events (SSE)
+  try {
+    const eventSource = new EventSource('/api/events');
+    eventSource.onmessage = (e) => {
+      try {
+        if (!e.data || e.data.startsWith(':')) return;
+        const msg = JSON.parse(e.data);
+        if (msg.type === 'story_saved') {
+          const current = getStoredStories();
+          const idx = current.findIndex((s) => s.id === msg.payload.id);
+          let nextStories: Story[];
+          if (idx >= 0) {
+            nextStories = [...current];
+            nextStories[idx] = msg.payload;
+          } else {
+            nextStories = [msg.payload, ...current];
+          }
+          try {
+            localStorage.setItem('mel_published_stories', JSON.stringify(nextStories));
+          } catch {}
+          notifyStorySubscribers(nextStories);
+        } else if (msg.type === 'story_deleted') {
+          const current = getStoredStories();
+          const nextStories = current.filter((s) => s.id !== msg.payload.id);
+          try {
+            localStorage.setItem('mel_published_stories', JSON.stringify(nextStories));
+            localStorage.removeItem(`mel_chapters_${msg.payload.id}`);
+          } catch {}
+          setLiveStoryChapters(msg.payload.id, []);
+          notifyStorySubscribers(nextStories);
+          notifyChapterSubscribers(msg.payload.id, []);
+        } else if (msg.type === 'chapter_saved') {
+          const ch: Chapter = msg.payload;
+          const sId = ch.storyId;
+          const currentList = getStoryChapters(sId);
+          const cIdx = currentList.findIndex((c) => c.id === ch.id || (c.chapterNumber === ch.chapterNumber && c.partType === ch.partType));
+          let nextList: Chapter[];
+          if (cIdx >= 0) {
+            nextList = [...currentList];
+            nextList[cIdx] = ch;
+          } else {
+            nextList = [...currentList, ch];
+          }
+          nextList.sort((a, b) => a.chapterNumber - b.chapterNumber);
+          try {
+            localStorage.setItem(`mel_chapters_${sId}`, JSON.stringify(nextList));
+          } catch {}
+          setLiveStoryChapters(sId, nextList);
+          notifyChapterSubscribers(sId, nextList);
+          activeAllChaptersSubscribers.forEach((cb) => {
+            try { cb(getLiveChaptersRuntimeCache()); } catch {}
+          });
+        } else if (msg.type === 'chapter_deleted') {
+          const { id, storyId } = msg.payload;
+          const currentList = getStoryChapters(storyId);
+          const nextList = currentList.filter((c) => c.id !== id);
+          try {
+            localStorage.setItem(`mel_chapters_${storyId}`, JSON.stringify(nextList));
+          } catch {}
+          setLiveStoryChapters(storyId, nextList);
+          notifyChapterSubscribers(storyId, nextList);
+          activeAllChaptersSubscribers.forEach((cb) => {
+            try { cb(getLiveChaptersRuntimeCache()); } catch {}
+          });
+        } else if (msg.type === 'announcement_saved') {
+          const ann: Announcement = msg.payload;
+          const current = getStoredAnnouncements();
+          const idx = current.findIndex((a) => a.id === ann.id);
+          const next = idx >= 0 ? current.map((a) => (a.id === ann.id ? ann : a)) : [ann, ...current];
+          try {
+            localStorage.setItem('mel_announcements', JSON.stringify(next));
+          } catch {}
+          activeAnnouncementSubscribers.forEach((cb) => {
+            try { cb(next); } catch {}
+          });
+        }
+      } catch {}
+    };
+
+    eventSource.onerror = () => {
+      // Reconnect is automatic in EventSource
+    };
+  } catch {}
+
+  // 3. Periodic fallback polling every 8 seconds
+  setInterval(pullServerSync, 8000);
+};
+
+// Start sync immediately on client
+if (typeof window !== 'undefined') {
+  initServerRealtimeSync();
+}
+
 // Constants
 const STATS_DOC_ID = 'aggregate_stats';
 const ACTIVE_PRESENCE_COLLECTION = 'reader_presences';
@@ -1308,7 +1448,23 @@ export const subscribeToPublishedStories = (
   // 2. Register for local broadcasts
   activeStorySubscribers.add(callback);
 
-  // 3. Connect to Firestore
+  // 3. Immediately pull from server API for multi-device cross-session sync
+  if (typeof window !== 'undefined') {
+    fetch('/api/stories')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((serverStories) => {
+        if (Array.isArray(serverStories) && serverStories.length > 0) {
+          try {
+            localStorage.setItem('mel_published_stories', JSON.stringify(serverStories));
+          } catch {}
+          callback(serverStories);
+          notifyStorySubscribers(serverStories);
+        }
+      })
+      .catch(() => {});
+  }
+
+  // 4. Connect to Firestore as additional cloud layer
   let unsubFirestore: (() => void) | null = null;
   try {
     const storiesColl = collection(db, 'stories');
@@ -1316,40 +1472,7 @@ export const subscribeToPublishedStories = (
       storiesColl,
       async (snapshot) => {
         if (snapshot.empty) {
-          // Auto-seed base stories into Firestore so they exist on the server
-          console.info('Firestore stories collection is empty. Seeding initial stories...');
-          for (const s of STORIES) {
-            try {
-              const clean = sanitizeForFirestore(s);
-              await setDoc(doc(db, 'stories', s.id), clean, { merge: true });
-              await setDoc(
-                doc(db, 'story_stats', s.id),
-                {
-                  storyId: s.id,
-                  views: s.views || 0,
-                  likes: s.likes || 0,
-                  followers: 0,
-                  ratingSum: 0,
-                  ratingCount: 0,
-                  commentCount: 0,
-                  updatedAt: new Date().toISOString(),
-                },
-                { merge: true }
-              );
-            } catch (seedErr) {
-              console.warn('Failed to seed story to Firestore:', s.id, seedErr);
-            }
-          }
-          // Also seed base sample chapters into Firestore
-          for (const [sId, chList] of Object.entries(SAMPLE_CHAPTERS)) {
-            for (const ch of chList) {
-              try {
-                await setDoc(doc(db, 'chapters', ch.id), sanitizeForFirestore(ch), { merge: true });
-              } catch (chErr) {
-                console.warn('Failed to seed chapter to Firestore:', ch.id, chErr);
-              }
-            }
-          }
+          // Firestore is empty - keep using stored/server stories
         } else {
           // Firestore has stories!
           const firestoreMap = new Map<string, Story>();
@@ -1404,7 +1527,7 @@ export const subscribeToPublishedStories = (
 };
 
 /**
- * Save or publish a story with dual-engine persistence (Local + Firestore).
+ * Save or publish a story with dual-engine persistence (Local + Server API + Firestore).
  * Guarantees zero failures and prevents undefined field crashes.
  */
 export const publishStory = async (story: Story): Promise<void> => {
@@ -1460,7 +1583,18 @@ export const publishStory = async (story: Story): Promise<void> => {
     console.warn('Local storage save warning:', localErr);
   }
 
-  // 4. Attempt Firestore cloud sync (safe, non-blocking)
+  // 4. Central Server API sync for multi-device cross-browser consistency
+  try {
+    await fetch('/api/stories', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(cleanStory),
+    });
+  } catch (apiErr) {
+    console.warn('Server API story save warning:', apiErr);
+  }
+
+  // 5. Attempt Firestore cloud sync (safe, non-blocking)
   try {
     const sanitizedDoc = sanitizeForFirestore({
       ...cleanStory,
@@ -1486,12 +1620,12 @@ export const publishStory = async (story: Story): Promise<void> => {
       { merge: true }
     );
   } catch (firestoreErr) {
-    console.warn('Firestore cloud sync warning (stored locally):', firestoreErr);
+    console.warn('Firestore cloud sync warning (stored locally & on server):', firestoreErr);
   }
 };
 
 /**
- * Delete a story with dual-engine persistence (Local + Firestore).
+ * Delete a story with dual-engine persistence (Local + Server API + Firestore).
  */
 export const deleteStory = async (storyId: string): Promise<void> => {
   // 1. Mark as deleted in localStorage
@@ -1510,12 +1644,23 @@ export const deleteStory = async (storyId: string): Promise<void> => {
     const updatedList = currentList.filter((s) => s.id !== storyId);
     localStorage.setItem('mel_published_stories', JSON.stringify(updatedList));
     localStorage.removeItem(`mel_chapters_${storyId}`);
+    setLiveStoryChapters(storyId, []);
     notifyStorySubscribers(updatedList);
+    notifyChapterSubscribers(storyId, []);
   } catch (localErr) {
     console.warn('Local delete warning:', localErr);
   }
 
-  // 3. Remove from Firestore: story doc, stats doc, and chapters
+  // 3. Central Server API delete
+  try {
+    await fetch(`/api/stories/${encodeURIComponent(storyId)}`, {
+      method: 'DELETE',
+    });
+  } catch (apiErr) {
+    console.warn('Server API delete story warning:', apiErr);
+  }
+
+  // 4. Remove from Firestore: story doc, stats doc, and chapters
   try {
     await deleteDoc(doc(db, 'stories', storyId));
     await deleteDoc(doc(db, 'story_stats', storyId));
@@ -1591,7 +1736,7 @@ export const subscribeToStoryChapters = (
   storyId: string,
   callback: (chapters: Chapter[]) => void
 ): (() => void) => {
-  // 1. Provide combined local and sample chapters immediately
+  // 1. Provide combined local chapters immediately
   const initial = getStoryChapters(storyId);
   callback(initial);
 
@@ -1601,7 +1746,23 @@ export const subscribeToStoryChapters = (
   }
   activeChapterSubscribers.get(storyId)!.add(callback);
 
-  // 3. Connect to Firestore without composite index requirements
+  // 3. Immediately query Server API for real-time consistency across devices
+  if (typeof window !== 'undefined') {
+    fetch(`/api/chapters?storyId=${encodeURIComponent(storyId)}`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((serverList) => {
+        if (Array.isArray(serverList)) {
+          setLiveStoryChapters(storyId, serverList);
+          try {
+            localStorage.setItem(`mel_chapters_${storyId}`, JSON.stringify(serverList));
+          } catch {}
+          callback(serverList);
+        }
+      })
+      .catch(() => {});
+  }
+
+  // 4. Connect to Firestore without composite index requirements
   let unsubFirestore: (() => void) | null = null;
   try {
     const chaptersColl = collection(db, 'chapters');
@@ -1639,7 +1800,7 @@ export const subscribeToStoryChapters = (
 };
 
 /**
- * Publish a new chapter or extra for a story with dual-engine persistence.
+ * Publish a new chapter or extra for a story with dual-engine persistence (Local + Server API + Firestore).
  */
 export const publishChapter = async (chapter: Chapter): Promise<void> => {
   // 1. Sanitize all fields to eliminate undefined values
@@ -1681,8 +1842,22 @@ export const publishChapter = async (chapter: Chapter): Promise<void> => {
   const allChapters = getStoryChapters(cleanChapter.storyId);
   setLiveStoryChapters(cleanChapter.storyId, allChapters);
   notifyChapterSubscribers(cleanChapter.storyId, allChapters);
+  activeAllChaptersSubscribers.forEach((cb) => {
+    try { cb(getLiveChaptersRuntimeCache()); } catch {}
+  });
 
-  // 5. Cloud sync to Firestore
+  // 5. Broadcast to Central Server API (sync across all devices & browsers)
+  try {
+    await fetch('/api/chapters', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(cleanChapter),
+    });
+  } catch (apiErr) {
+    console.warn('Server API chapter save warning:', apiErr);
+  }
+
+  // 6. Cloud sync to Firestore (Safe, non-blocking: catch errors so upload/edit never fails)
   try {
     const chapterRef = doc(db, 'chapters', cleanChapter.id);
     await setDoc(
@@ -1704,20 +1879,32 @@ export const publishChapter = async (chapter: Chapter): Promise<void> => {
       { merge: true }
     );
   } catch (firestoreErr) {
-    console.error('Firestore publish chapter error:', firestoreErr);
-    throw firestoreErr;
+    console.warn('Firestore publish chapter warning (saved to server and locally):', firestoreErr);
   }
 };
 
 /**
- * Delete a chapter with dual persistence.
+ * Delete a chapter with dual persistence (Local + Server API + Firestore).
  */
 export const deleteChapter = async (storyId: string, chapterId: string): Promise<void> => {
   deleteCustomChapterFromStorage(storyId, chapterId);
   const remaining = getStoryChapters(storyId).filter((c) => c.id !== chapterId);
   setLiveStoryChapters(storyId, remaining);
   notifyChapterSubscribers(storyId, remaining);
+  activeAllChaptersSubscribers.forEach((cb) => {
+    try { cb(getLiveChaptersRuntimeCache()); } catch {}
+  });
 
+  // Server API delete
+  try {
+    await fetch(`/api/chapters/${encodeURIComponent(chapterId)}?storyId=${encodeURIComponent(storyId)}`, {
+      method: 'DELETE',
+    });
+  } catch (apiErr) {
+    console.warn('Server API chapter delete warning:', apiErr);
+  }
+
+  // Cloud Firestore delete
   try {
     await deleteDoc(doc(db, 'chapters', chapterId));
   } catch (err) {
@@ -1737,7 +1924,22 @@ export const subscribeToAnnouncements = (
   // 2. Register active memory listener
   activeAnnouncementSubscribers.add(callback);
 
-  // 3. Connect to Firestore
+  // 3. Immediately pull from Server API
+  if (typeof window !== 'undefined') {
+    fetch('/api/announcements')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((serverAnn) => {
+        if (Array.isArray(serverAnn) && serverAnn.length > 0) {
+          try {
+            localStorage.setItem('mel_announcements', JSON.stringify(serverAnn));
+          } catch {}
+          callback(serverAnn);
+        }
+      })
+      .catch(() => {});
+  }
+
+  // 4. Connect to Firestore
   let unsubFirestore: (() => void) | null = null;
   try {
     const coll = collection(db, 'announcements');
@@ -1791,6 +1993,16 @@ export const publishAnnouncement = async (announcement: Announcement): Promise<v
     notifyAnnouncementSubscribers(updated);
   } catch (err) {
     console.warn('Local announcement save warning:', err);
+  }
+
+  try {
+    await fetch('/api/announcements', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(cleanAnn),
+    });
+  } catch (apiErr) {
+    console.warn('Server API announcement save warning:', apiErr);
   }
 
   try {

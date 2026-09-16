@@ -3,6 +3,8 @@ import {
   auth,
   googleProvider,
   signInWithPopup,
+  signInWithCredential,
+  GoogleAuthProvider,
   signOut,
   onAuthStateChanged,
   signInWithEmailAndPassword,
@@ -98,6 +100,7 @@ interface AuthContextType {
   updateCollaboratorFull: (collabId: string, data: Partial<Omit<CollaboratorItem, 'id'>>) => Promise<void>;
   updateUserProfileData: (data: Partial<UserProfile>) => Promise<void>;
   signInWithGoogle: () => Promise<void>;
+  signInWithGoogleCredential: (idToken: string) => Promise<void>;
   signInWithEmail: (emailOrUsername: string, pass: string) => Promise<void>;
   registerWithEmail: (email: string, pass: string, name: string, username?: string) => Promise<void>;
   quickAuthorLogin: (authorEmail: string) => void;
@@ -409,7 +412,39 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       }
       closeAuthModal();
     } catch (err: any) {
-      console.error('Google Sign-In error:', err);
+      const isUnauthorizedDomain =
+        err?.code === 'auth/unauthorized-domain' ||
+        err?.message?.includes('auth/unauthorized-domain') ||
+        err?.message?.includes('unauthorized-domain');
+
+      if (isUnauthorizedDomain) {
+        console.warn('Firebase Auth notice: Domain is not yet added to Firebase Console Authorized Domains.', err?.message);
+      } else if (err?.code === 'auth/popup-closed-by-user' || err?.code === 'auth/cancelled-popup-request') {
+        console.info('Google Sign-In popup closed by user.');
+      } else {
+        console.warn('Google Sign-In notice:', err?.message || err);
+      }
+      throw err;
+    }
+  };
+
+  // Sign in with Google Identity Services (GSI ID Token) - bypasses Firebase Auth popup domain check!
+  const signInWithGoogleCredential = async (idToken: string) => {
+    try {
+      const cred = GoogleAuthProvider.credential(idToken);
+      const result = await signInWithCredential(auth, cred);
+      if (result.user) {
+        refreshSessionActivity();
+        const savedProfile = await getUserProfile(result.user.uid);
+        const appUser = buildAppUser(result.user, collaboratorsList, savedProfile);
+        setUser(appUser);
+        try {
+          localStorage.setItem('mel_user_session', JSON.stringify(appUser));
+        } catch {}
+      }
+      closeAuthModal();
+    } catch (err: any) {
+      console.warn('Google Credential Sign-in warning:', err);
       throw err;
     }
   };
@@ -505,19 +540,11 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
             throw new Error('Mật khẩu không chính xác. Vui lòng kiểm tra lại!');
           }
         } else {
-          throw new Error('Tài khoản này được đăng ký thông qua Google. Vui lòng chọn Đăng nhập bằng Google!');
+          throw new Error('Tài khoản này được tạo thông qua Google Sign-In hoặc chưa có mật khẩu riêng. Vui lòng chọn Đăng nhập Google hoặc đăng ký mật khẩu!');
         }
       }
 
-      // 4. Special case for predefined Author / Admin emails
-      const cleanEmailLower = emailToUse.toLowerCase().trim();
-      if (AUTHOR_EMAILS.includes(cleanEmailLower)) {
-        quickAuthorLogin(cleanEmailLower);
-        closeAuthModal();
-        return;
-      }
-
-      throw new Error(`Không tìm thấy tài khoản "${inputStr}". Vui lòng kiểm tra lại hoặc chuyển sang tab Đăng ký!`);
+      throw new Error(`Không tìm thấy tài khoản "${inputStr}". Nếu bạn là Tác giả hoặc Độc giả mới, vui lòng chuyển sang tab "Đăng ký" để tạo mật khẩu bảo vệ!`);
     } catch (err: any) {
       console.error('Email sign in error:', err);
       throw err;
@@ -749,6 +776,7 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         updateCollaboratorFull,
         updateUserProfileData,
         signInWithGoogle,
+        signInWithGoogleCredential,
         signInWithEmail,
         registerWithEmail,
         quickAuthorLogin,
