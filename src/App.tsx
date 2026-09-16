@@ -69,10 +69,10 @@ export default function App() {
   // Real-time synchronization of published stories, chapters & announcements across all devices
   useEffect(() => {
     const unsubStories = subscribeToPublishedStories((liveStories) => {
-      if (liveStories && liveStories.length > 0) {
+      if (Array.isArray(liveStories) && liveStories.length > 0) {
         setStories(liveStories);
-      } else {
-        setStories(STORIES);
+      } else if (Array.isArray(liveStories)) {
+        setStories(liveStories);
       }
     });
 

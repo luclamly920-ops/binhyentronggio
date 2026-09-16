@@ -19,6 +19,7 @@ import {
   writeBatch,
   serverTimestamp,
   arrayUnion,
+  arrayRemove,
   type Firestore,
 } from 'firebase/firestore';
 import {
@@ -80,6 +81,7 @@ export {
   addDoc,
   serverTimestamp,
   arrayUnion,
+  arrayRemove,
   GoogleAuthProvider,
   signInWithPopup,
   signInWithRedirect,

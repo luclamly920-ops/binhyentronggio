@@ -825,13 +825,18 @@ export const getStoryChapters = (storyId: string): Chapter[] => {
     return liveChaptersRuntimeCache[storyId];
   }
 
-  // 2. Retrieve custom author-published chapters from local storage
-  const customChapters = getStoredCustomChapters(storyId);
-  if (customChapters.length > 0) {
-    return customChapters;
-  }
+  // 2. Retrieve custom author-published chapters from local storage if saved
+  try {
+    const raw = localStorage.getItem(`mel_chapters_${storyId}`);
+    if (raw !== null) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        return parsed;
+      }
+    }
+  } catch {}
 
-  // 3. Retrieve base sample chapters only for predefined seed stories
+  // 3. Retrieve base sample chapters only for predefined seed stories if not yet initialized
   if (SAMPLE_CHAPTERS[storyId] && SAMPLE_CHAPTERS[storyId].length > 0) {
     return SAMPLE_CHAPTERS[storyId];
   } else if (storyId === 'anh-dao-nam-centimet' && SAMPLE_CHAPTERS['anh-dao-5cm']) {

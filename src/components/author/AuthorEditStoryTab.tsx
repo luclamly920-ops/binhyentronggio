@@ -144,9 +144,12 @@ export const AuthorEditStoryTab: React.FC<AuthorEditStoryTabProps> = ({
 
   const handleDeleteStory = async () => {
     if (!selectedStory) return;
+    const deletedTitle = selectedStory.title;
+    const nextStory = stories.find((s) => s.id !== selectedStory.id);
     try {
       await deleteStory(selectedStory.id);
-      onFeedback('success', `Đã xóa tác phẩm "${selectedStory.title}".`);
+      setSelectedStoryId(nextStory ? nextStory.id : '');
+      onFeedback('success', `Đã xóa tác phẩm "${deletedTitle}".`);
       setConfirmDelete(false);
       if (onStoriesUpdated) onStoriesUpdated();
     } catch {
